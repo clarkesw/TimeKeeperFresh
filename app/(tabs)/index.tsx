@@ -1,6 +1,6 @@
 // =============================================================================
 // !! CLAUDE: ALWAYS INCREMENT APP_VERSION BEFORE PROVIDING THIS FILE !!
-// Current: v1.0.5
+// Current: v1.0.14
 // Format:  v1.0.X — bump X by 1 for every change, no exceptions
 // Located: const APP_VERSION = 'v1.0.X' just below the imports
 // =============================================================================
@@ -19,7 +19,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 const GOAL_HOURS = 5;
 const SEED_DAYS = 915;
 const SEED_HOURS = 2977.0;
-const APP_VERSION = 'v1.0.5';
+const APP_VERSION = 'v1.0.14';
 
 const TASK_COLUMNS = [
   'Paid Work', 'Java Study', 'Code Practice',
@@ -33,6 +33,10 @@ const CACHE_KEY_ENTRIES = 'tt_entries_today';
 const CACHE_KEY_QUEUE   = 'tt_offline_queue';
 const CACHE_KEY_TOKEN   = 'tt_dropbox_token';
 const CACHE_KEY_ALLTIME = 'tt_alltime';
+
+// Lifetime days/hours now live in their own small Dropbox file instead of being
+// recomputed from every monthly CSV on every load.
+const LIFETIME_STATS_PATH = '/lifetime_stats.json';
 
 const { width: SW } = Dimensions.get('window');
 
@@ -56,7 +60,20 @@ interface SessionData {
 }
 
 interface DayTotal { date: string; total_ms: number; is_today: boolean; }
-interface AlltimeStats { days: number; hours: number; }
+interface AlltimeStats {
+  days: number;
+  hours: number;
+  totalSessions?: number;
+  longestSessionHours?: number;
+  longestSessionDate?: string;
+  avgSessionHours?: number;
+  bestDayHours?: number;
+  bestDayDate?: string;
+  topTask?: string;
+  topTaskCount?: number;
+  taskCounts?: Record<string, number>;
+  lastSeenDate?: string; // tracks the most recent date a session was recorded, for day-counting
+}
 
 // ---------------------------------------------------------------------------
 // Dropbox helpers
@@ -77,13 +94,20 @@ async function getAccessToken(): Promise<string | null> {
       body: `grant_type=refresh_token&refresh_token=${DROPBOX_REFRESH}`,
     });
     const data = await res.json();
-    if (!data.access_token) return null;
+    if (!data.access_token) {
+      lastTokenError = `Token refresh failed: HTTP ${res.status} — ${JSON.stringify(data).slice(0, 200)}`;
+      return null;
+    }
+    lastTokenError = '';
     await AsyncStorage.setItem(CACHE_KEY_TOKEN, JSON.stringify({
       token: data.access_token,
       expires: Date.now() + (data.expires_in || 14400) * 1000,
     }));
     return data.access_token;
-  } catch { return null; }
+  } catch (e) {
+    lastTokenError = `Token refresh exception: ${e}`;
+    return null;
+  }
 }
 
 function getMonthFilename(date: Date = new Date()): string {
@@ -96,7 +120,17 @@ function getMonthPrefix(date: Date = new Date()): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}`;
 }
 
-async function downloadCSV(token: string, path: string): Promise<string | null> {
+type DownloadResult =
+  | { status: 'ok'; content: string }
+  | { status: 'not_found' }
+  | { status: 'error'; detail: string };
+
+// Module-level diagnostic capture — surfaced in the debug panel so real failures are visible
+// instead of silently falling back to cache.
+let lastDropboxError = '';
+let lastTokenError = '';
+
+async function downloadCSVSafe(token: string, path: string): Promise<DownloadResult> {
   try {
     const res = await fetch('https://content.dropboxapi.com/2/files/download', {
       method: 'POST',
@@ -105,9 +139,32 @@ async function downloadCSV(token: string, path: string): Promise<string | null> 
         'Dropbox-API-Arg': JSON.stringify({ path }),
       },
     });
-    if (!res.ok) return null;
-    return await res.text();
-  } catch { return null; }
+    if (res.status === 409) {
+      // Dropbox returns 409 with path/not_found error when the file genuinely doesn't exist
+      const body = await res.text();
+      if (body.includes('not_found')) { lastDropboxError = ''; return { status: 'not_found' }; }
+      lastDropboxError = `409 (not "not_found"): ${body.slice(0, 200)}`;
+      return { status: 'error', detail: lastDropboxError };
+    }
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      lastDropboxError = `HTTP ${res.status} on ${path}: ${body.slice(0, 200)}`;
+      return { status: 'error', detail: lastDropboxError };
+    }
+    const content = await res.text();
+    lastDropboxError = ''; // clear stale error now that this request succeeded
+    return { status: 'ok', content };
+  } catch (e) {
+    lastDropboxError = `Network exception on ${path}: ${e}`;
+    return { status: 'error', detail: lastDropboxError };
+  }
+}
+
+// Legacy wrapper kept for callers that only care about content (histogram/alltime reads).
+// Treats both not_found and error as null — safe ONLY for read-only aggregation, never for writes.
+async function downloadCSV(token: string, path: string): Promise<string | null> {
+  const result = await downloadCSVSafe(token, path);
+  return result.status === 'ok' ? result.content : null;
 }
 
 async function uploadCSV(token: string, path: string, content: string): Promise<boolean> {
@@ -125,22 +182,51 @@ async function uploadCSV(token: string, path: string, content: string): Promise<
   } catch { return false; }
 }
 
+// --- Lifetime stats file: a single small JSON file instead of recomputing
+// totals from every monthly CSV on every app load. ---
+async function readLifetimeStats(token: string): Promise<AlltimeStats | null> {
+  const result = await downloadCSVSafe(token, LIFETIME_STATS_PATH);
+  if (result.status !== 'ok') return null;
+  try {
+    const parsed = JSON.parse(result.content);
+    if (typeof parsed.days === 'number' && typeof parsed.hours === 'number') return parsed;
+    return null;
+  } catch { return null; }
+}
+
+async function writeLifetimeStats(token: string, stats: AlltimeStats): Promise<boolean> {
+  const body = JSON.stringify({ ...stats, lastUpdated: new Date().toISOString() }, null, 2);
+  return uploadCSV(token, LIFETIME_STATS_PATH, body);
+}
+
 // ---------------------------------------------------------------------------
 // CSV helpers
 // ---------------------------------------------------------------------------
-const CSV_HEADER = 'Type,Timestamp,Date,Time,Paid Work,Java Study,Code Practice,Interview Ques.,Business Idea,Church Work,Notes,Days Accessed,Total Hours';
 const CSV_FIELDS = ['Type','Timestamp','Date','Time','Paid Work','Java Study','Code Practice','Interview Ques.','Business Idea','Church Work','Notes','Days Accessed','Total Hours'];
+
+// Module-level: remembers which delimiter the most recently parsed file used,
+// so writes go back out in the same format the file was already using.
+let detectedDelimiter = ',';
 
 function parseCSV(content: string): Record<string, string>[] {
   const lines = content.trim().split('\n');
   if (lines.length < 2) return [];
-  const headers = lines[0].split(',').map(h => h.trim());
+
+  // Auto-detect delimiter: some exports (e.g. regional Excel/Numbers settings)
+  // use semicolons instead of commas. Pick whichever appears more in the header row.
+  const headerLine = lines[0];
+  const commaCount = (headerLine.match(/,/g) || []).length;
+  const semicolonCount = (headerLine.match(/;/g) || []).length;
+  const delim = semicolonCount > commaCount ? ';' : ',';
+  detectedDelimiter = delim;
+
+  const headers = headerLine.split(delim).map(h => h.trim());
   return lines.slice(1).map(line => {
     const vals: string[] = [];
     let cur = '', inQ = false;
     for (const ch of line) {
       if (ch === '"') { inQ = !inQ; }
-      else if (ch === ',' && !inQ) { vals.push(cur); cur = ''; }
+      else if (ch === delim && !inQ) { vals.push(cur); cur = ''; }
       else { cur += ch; }
     }
     vals.push(cur);
@@ -151,10 +237,15 @@ function parseCSV(content: string): Record<string, string>[] {
 }
 
 function rowToLine(row: Record<string, string>): string {
+  const delim = detectedDelimiter;
   return CSV_FIELDS.map(f => {
     const v = row[f] || '';
-    return v.includes(',') || v.includes('"') ? `"${v.replace(/"/g, '""')}"` : v;
-  }).join(',');
+    return v.includes(delim) || v.includes('"') ? `"${v.replace(/"/g, '""')}"` : v;
+  }).join(delim);
+}
+
+function getCsvHeader(): string {
+  return CSV_FIELDS.join(detectedDelimiter);
 }
 
 function pad(n: number) { return String(n).padStart(2, '0'); }
@@ -203,6 +294,100 @@ function calcFileStats(rows: Record<string, string>[]): { days: number; hours: n
   return { days: daySet.size, hours: totalMs / 3600000 };
 }
 
+// Richer pass over the same rows — adds per-session, per-day, and per-task
+// breakdowns. Kept separate from calcFileStats so existing callers (which only
+// need days/hours) aren't slowed down by work they don't use.
+interface FullStats {
+  days: number;
+  hours: number;
+  totalSessions: number;
+  longestSessionHours: number;
+  longestSessionDate: string;
+  avgSessionHours: number;
+  bestDayHours: number;
+  bestDayDate: string;
+  taskCounts: Record<string, number>;
+}
+
+function calcFullStats(rows: Record<string, string>[]): FullStats {
+  const daySet = new Set<string>();
+  const dayTotals: Record<string, number> = {};
+  const taskCounts: Record<string, number> = {};
+  let totalMs = 0, sessionCount = 0;
+  let longestMs = 0, longestDate = '';
+  let startTs: Date | null = null, startDate = '';
+
+  for (const row of rows) {
+    if (row.Date) daySet.add(row.Date);
+    if (row.Type === 'START') {
+      startTs = new Date(row.Timestamp);
+      startDate = row.Date || '';
+    } else if (row.Type === 'END' && startTs) {
+      const e = new Date(row.Timestamp);
+      if (!isNaN(e.getTime())) {
+        const dur = e.getTime() - startTs.getTime();
+        totalMs += dur;
+        sessionCount += 1;
+        if (dur > longestMs) { longestMs = dur; longestDate = startDate; }
+        if (startDate) dayTotals[startDate] = (dayTotals[startDate] || 0) + dur;
+        for (const task of TASK_COLUMNS) {
+          if (row[task]?.toLowerCase() === 'x') {
+            taskCounts[task] = (taskCounts[task] || 0) + 1;
+          }
+        }
+      }
+      startTs = null;
+    }
+  }
+
+  let bestDayMs = 0, bestDayDate = '';
+  for (const [date, ms] of Object.entries(dayTotals)) {
+    if (ms > bestDayMs) { bestDayMs = ms; bestDayDate = date; }
+  }
+
+  return {
+    days: daySet.size,
+    hours: totalMs / 3600000,
+    totalSessions: sessionCount,
+    longestSessionHours: Math.round((longestMs / 3600000) * 10) / 10,
+    longestSessionDate: longestDate,
+    avgSessionHours: sessionCount > 0 ? Math.round((totalMs / 3600000 / sessionCount) * 10) / 10 : 0,
+    bestDayHours: Math.round((bestDayMs / 3600000) * 10) / 10,
+    bestDayDate,
+    taskCounts,
+  };
+}
+
+// Merge two FullStats-shaped partial results — used when combining the current
+// month's CSV with the previous lifetime totals during the one-time migration.
+function mergeFullStats(a: FullStats, b: FullStats): FullStats {
+  const taskCounts: Record<string, number> = { ...a.taskCounts };
+  for (const [k, v] of Object.entries(b.taskCounts)) taskCounts[k] = (taskCounts[k] || 0) + v;
+
+  const totalSessions = a.totalSessions + b.totalSessions;
+  const totalHours = a.hours + b.hours;
+
+  const [longestHours, longestDate] = a.longestSessionHours >= b.longestSessionHours
+    ? [a.longestSessionHours, a.longestSessionDate]
+    : [b.longestSessionHours, b.longestSessionDate];
+
+  const [bestDayHours, bestDayDate] = a.bestDayHours >= b.bestDayHours
+    ? [a.bestDayHours, a.bestDayDate]
+    : [b.bestDayHours, b.bestDayDate];
+
+  return {
+    days: a.days + b.days,
+    hours: totalHours,
+    totalSessions,
+    longestSessionHours: longestHours,
+    longestSessionDate: longestDate,
+    avgSessionHours: totalSessions > 0 ? Math.round((totalHours / totalSessions) * 10) / 10 : 0,
+    bestDayHours,
+    bestDayDate,
+    taskCounts,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Main component
 // ---------------------------------------------------------------------------
@@ -218,12 +403,18 @@ export default function TimeTracker() {
   const [todayTaskMs, setTodayTaskMs]                 = useState<Record<string, number>>({});
 
   const [noteText, setNoteText]           = useState('');
-  const [saveStatus, setSaveStatus]       = useState<{ msg: string; ok: boolean } | null>(null);
   const [histogramData, setHistogramData] = useState<DayTotal[]>([]);
   const [alltime, setAlltime]             = useState<AlltimeStats | null>(null);
   const [loading, setLoading]             = useState(true);
   const [syncing, setSyncing]             = useState(false);
   const [refreshing, setRefreshing]       = useState(false);
+  const [showDebug, setShowDebug]         = useState(false);
+  const [debugInfo, setDebugInfo]         = useState<string>('');
+  const [flushStatus, setFlushStatus]     = useState<string>('');
+  // Tracks whether our in-memory/cached row set is confirmed authoritative
+  // (i.e. successfully downloaded from Dropbox this app session, OR confirmed file doesn't exist yet).
+  // Writes are blocked entirely until this is true — prevents overwriting real data with a partial cache.
+  const dataIsAuthoritative = useRef(false);
 
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const thermAnim   = useRef(new Animated.Value(0)).current;
@@ -298,22 +489,39 @@ export default function TimeTracker() {
 
     // Group by path so multiple offline sessions for same file merge correctly
     const byPath: Record<string, Record<string, string>[]> = {};
+    const unconfirmedPaths = new Set<string>();
+
     for (const item of queue) {
       if (!byPath[item.path]) {
-        // Download latest from Dropbox as base, fall back to item rows
-        const existing = await downloadCSV(token, item.path);
-        byPath[item.path] = existing ? parseCSV(existing) : item.rows;
-      } else {
-        // Append any new rows not already in the merged set
-        const existingTs = new Set(byPath[item.path].map(r => r.Timestamp));
-        for (const row of item.rows) {
-          if (!existingTs.has(row.Timestamp)) byPath[item.path].push(row);
+        // Must confirm the real state of the remote file before merging — never guess.
+        const result = await downloadCSVSafe(token, item.path);
+        if (result.status === 'ok') {
+          byPath[item.path] = parseCSV(result.content);
+        } else if (result.status === 'not_found') {
+          byPath[item.path] = []; // confirmed empty — safe to start fresh
+        } else {
+          // Could not confirm — do NOT proceed with this path this round.
+          unconfirmedPaths.add(item.path);
+          byPath[item.path] = []; // placeholder, will be skipped below
+          continue;
         }
+      }
+      if (unconfirmedPaths.has(item.path)) continue;
+      // Append any new rows not already in the merged set
+      const existingTs = new Set(byPath[item.path].map(r => r.Timestamp));
+      for (const row of item.rows) {
+        if (!existingTs.has(row.Timestamp)) byPath[item.path].push(row);
       }
     }
 
     const failed: Array<{ path: string; rows: Record<string, string>[] }> = [];
     for (const [path, rows] of Object.entries(byPath)) {
+      if (unconfirmedPaths.has(path)) {
+        // Keep original queued items for this path untouched for next attempt
+        const originalItems = queue.filter(q => q.path === path);
+        failed.push(...originalItems);
+        continue;
+      }
       // Re-stamp totals
       const stats = calcFileStats(rows);
       rows.forEach(r => { r['Days Accessed'] = ''; r['Total Hours'] = ''; });
@@ -322,7 +530,7 @@ export default function TimeTracker() {
         rows[rows.length - 1 - lastEnd]['Days Accessed'] = String(stats.days);
         rows[rows.length - 1 - lastEnd]['Total Hours'] = stats.hours.toFixed(1);
       }
-      const content = CSV_HEADER + '\n' + rows.map(rowToLine).join('\n') + '\n';
+      const content = getCsvHeader() + '\n' + rows.map(rowToLine).join('\n') + '\n';
       const ok = await uploadCSV(token, path, content);
       if (!ok) failed.push({ path, rows });
     }
@@ -338,7 +546,7 @@ export default function TimeTracker() {
       const token = await getAccessToken();
       if (!token) throw new Error('no token');
       await flushQueue(token);
-      const content = CSV_HEADER + '\n' + rows.map(rowToLine).join('\n') + '\n';
+      const content = getCsvHeader() + '\n' + rows.map(rowToLine).join('\n') + '\n';
       const ok = await uploadCSV(token, path, content);
       if (!ok) throw new Error('upload failed');
     } catch {
@@ -360,25 +568,37 @@ export default function TimeTracker() {
       if (token) {
         await flushQueue(token);
         const filename = getMonthFilename();
-        const csv = await downloadCSV(token, `/${filename}`);
-        if (csv) {
-          allRows = parseCSV(csv);
+        const result = await downloadCSVSafe(token, `/${filename}`);
+        if (result.status === 'ok') {
+          allRows = parseCSV(result.content);
           await AsyncStorage.setItem(CACHE_KEY_ENTRIES, JSON.stringify(allRows));
+          dataIsAuthoritative.current = true;
+        } else if (result.status === 'not_found') {
+          // Confirmed: file genuinely doesn't exist yet this month — empty is correct and safe
+          allRows = [];
+          await AsyncStorage.setItem(CACHE_KEY_ENTRIES, JSON.stringify(allRows));
+          dataIsAuthoritative.current = true;
         } else {
+          // status === 'error' — could be auth/network/rate-limit. We do NOT know the true state.
+          // Fall back to cache for DISPLAY only; do not mark authoritative, so writes stay blocked.
           const cached = await AsyncStorage.getItem(CACHE_KEY_ENTRIES);
           if (cached) {
             const monthPrefix = getMonthPrefix(new Date());
             allRows = (JSON.parse(cached) as Record<string, string>[])
               .filter(r => !r.Date || r.Date.startsWith(monthPrefix));
           }
+          dataIsAuthoritative.current = false;
+          console.warn('Could not confirm Dropbox file state — writes blocked until next successful sync');
         }
-        loadHistogramData(token, allRows);
-        loadAlltimeData(token);
+        await loadHistogramData(token, allRows);
+        await loadAlltimeData(token);
       } else {
         const cached = await AsyncStorage.getItem(CACHE_KEY_ENTRIES);
         if (cached) allRows = JSON.parse(cached);
         const cachedAt = await AsyncStorage.getItem(CACHE_KEY_ALLTIME);
         if (cachedAt) setAlltime(JSON.parse(cachedAt));
+        // No token at all — can't confirm anything against Dropbox right now
+        dataIsAuthoritative.current = false;
       }
 
       const todayRows = allRows.filter(r => r.Date === todayStr);
@@ -405,44 +625,96 @@ export default function TimeTracker() {
   }, [recalcFromEntries]);
 
   const loadHistogramData = async (token: string, allRows: Record<string, string>[]) => {
-    const today = new Date();
-    let prevRows: Record<string, string>[] = [];
-    const prevDate = new Date(today.getFullYear(), today.getMonth(), 0);
-    const prevCsv = await downloadCSV(token, `/TimeBackup/${getMonthFilename(prevDate)}`);
-    if (prevCsv) prevRows = parseCSV(prevCsv);
-    const combined = [...prevRows, ...allRows];
-    const result: DayTotal[] = [];
-    for (let i = 6; i >= 0; i--) {
-      const d = new Date(today); d.setDate(today.getDate() - i);
-      const dateStr = formatDate(d);
-      const dayRows = combined.filter(r => r.Date === dateStr);
-      let totalMs = 0, start: Date | null = null;
-      for (const r of dayRows) {
-        if (r.Type === 'START') { start = new Date(r.Timestamp); }
-        else if (r.Type === 'END' && start) {
-          totalMs += new Date(r.Timestamp).getTime() - start.getTime();
-          start = null;
-        }
+    try {
+      const today = new Date();
+      let prevRows: Record<string, string>[] = [];
+      const prevDate = new Date(today.getFullYear(), today.getMonth(), 0);
+      try {
+        // Previous month's data is a nice-to-have for the histogram's earlier days.
+        // If this single fetch fails, don't let it block today's data from showing.
+        const prevCsv = await downloadCSV(token, `/TimeBackup/${getMonthFilename(prevDate)}`);
+        if (prevCsv) prevRows = parseCSV(prevCsv);
+      } catch (e) {
+        console.warn('Previous month fetch failed (non-fatal):', e);
       }
-      result.push({ date: dateStr, total_ms: totalMs, is_today: i === 0 });
+      const combined = [...prevRows, ...allRows];
+      const result: DayTotal[] = [];
+      for (let i = 6; i >= 0; i--) {
+        const d = new Date(today); d.setDate(today.getDate() - i);
+        const dateStr = formatDate(d);
+        const dayRows = combined.filter(r => r.Date === dateStr);
+        let totalMs = 0, start: Date | null = null;
+        for (const r of dayRows) {
+          if (r.Type === 'START') { start = new Date(r.Timestamp); }
+          else if (r.Type === 'END' && start) {
+            totalMs += new Date(r.Timestamp).getTime() - start.getTime();
+            start = null;
+          }
+        }
+        result.push({ date: dateStr, total_ms: totalMs, is_today: i === 0 });
+      }
+      setHistogramData(result);
+    } catch (e) {
+      console.error('loadHistogramData failed entirely:', e);
+      lastDropboxError = `Histogram load failed: ${e}`;
     }
-    setHistogramData(result);
   };
 
   const loadAlltimeData = async (token: string) => {
     try {
-      let totalDays = 0, totalHours = 0;
+      // Fast path: read the dedicated lifetime stats file (one small request).
+      const existing = await readLifetimeStats(token);
+      if (existing) {
+        setAlltime(existing);
+        await AsyncStorage.setItem(CACHE_KEY_ALLTIME, JSON.stringify(existing));
+        return;
+      }
+
+      // One-time migration: file doesn't exist yet, so compute it the old way
+      // (scanning monthly CSVs) and write it out so every future load is fast.
+      let running: FullStats = {
+        days: 0, hours: 0, totalSessions: 0,
+        longestSessionHours: 0, longestSessionDate: '',
+        avgSessionHours: 0, bestDayHours: 0, bestDayDate: '',
+        taskCounts: {},
+      };
+
       const curCsv = await downloadCSV(token, `/${getMonthFilename()}`);
-      if (curCsv) { const s = calcFileStats(parseCSV(curCsv)); totalDays += s.days; totalHours += s.hours; }
+      if (curCsv) running = mergeFullStats(running, calcFullStats(parseCSV(curCsv)));
+
       const now = new Date();
       for (let i = 1; i <= 24; i++) {
         const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
         const csv = await downloadCSV(token, `/TimeBackup/${getMonthFilename(d)}`);
-        if (csv) { const s = calcFileStats(parseCSV(csv)); totalDays += s.days; totalHours += s.hours; }
+        if (csv) running = mergeFullStats(running, calcFullStats(parseCSV(csv)));
       }
-      const result = { days: totalDays + SEED_DAYS, hours: Math.round((totalHours + SEED_HOURS) * 10) / 10 };
+
+      // Find the most-used task across everything we scanned
+      let topTask = '', topTaskCount = 0;
+      for (const [task, count] of Object.entries(running.taskCounts)) {
+        if (count > topTaskCount) { topTask = task; topTaskCount = count; }
+      }
+
+      const result: AlltimeStats = {
+        days: running.days + SEED_DAYS,
+        hours: Math.round((running.hours + SEED_HOURS) * 10) / 10,
+        totalSessions: running.totalSessions,
+        longestSessionHours: running.longestSessionHours,
+        longestSessionDate: running.longestSessionDate,
+        avgSessionHours: running.avgSessionHours,
+        bestDayHours: running.bestDayHours,
+        bestDayDate: running.bestDayDate,
+        topTask,
+        topTaskCount,
+        taskCounts: running.taskCounts,
+        // Set to today on migration so the very next session doesn't double-count
+        // a day that's already reflected in the scanned CSV totals above.
+        lastSeenDate: formatDate(new Date()),
+      };
+
       setAlltime(result);
       await AsyncStorage.setItem(CACHE_KEY_ALLTIME, JSON.stringify(result));
+      await writeLifetimeStats(token, result); // persist so next load uses the fast path
     } catch (e) { console.error('loadAlltime:', e); }
   };
 
@@ -451,6 +723,52 @@ export default function TimeTracker() {
     const path = `/${filename}`;
     const token = await getAccessToken();
     let rows: Record<string, string>[] = [];
+
+    // SAFETY GATE: if we haven't confirmed the true state of the Dropbox file this session,
+    // try ONE more time right now before touching anything. If we still can't confirm it,
+    // queue this entry locally instead of risking an overwrite of real data.
+    if (!dataIsAuthoritative.current && token) {
+      const result = await downloadCSVSafe(token, path);
+      if (result.status === 'ok') {
+        rows = parseCSV(result.content);
+        await AsyncStorage.setItem(CACHE_KEY_ENTRIES, JSON.stringify(rows));
+        dataIsAuthoritative.current = true;
+      } else if (result.status === 'not_found') {
+        rows = [];
+        dataIsAuthoritative.current = true;
+      }
+      // if still 'error', dataIsAuthoritative.current stays false — handled below
+    }
+
+    if (!dataIsAuthoritative.current) {
+      // We genuinely cannot confirm what's on Dropbox right now. Queue this entry
+      // against the local cache (today's known rows) and let the offline queue's
+      // merge-by-timestamp logic reconcile it safely once we're back online —
+      // never upload with overwrite while state is unconfirmed.
+      const cached = await AsyncStorage.getItem(CACHE_KEY_ENTRIES);
+      const allCached: Record<string, string>[] = cached ? JSON.parse(cached) : [];
+      const monthPrefix = getMonthPrefix(timestamp);
+      rows = allCached.filter(r => !r.Date || r.Date.startsWith(monthPrefix));
+
+      const newRow: Record<string, string> = {};
+      CSV_FIELDS.forEach(f => newRow[f] = '');
+      newRow.Type = type;
+      newRow.Timestamp = formatTimestamp(timestamp);
+      newRow.Date = formatDate(timestamp);
+      newRow.Time = formatTime(timestamp);
+      if (type === 'END') {
+        tasks.forEach(t => { if (CSV_FIELDS.includes(t)) newRow[t] = 'x'; });
+        if (note) newRow.Notes = note;
+      }
+      rows.push(newRow);
+      await AsyncStorage.setItem(CACHE_KEY_ENTRIES, JSON.stringify(rows));
+
+      const raw = await AsyncStorage.getItem(CACHE_KEY_QUEUE);
+      const queue = raw ? JSON.parse(raw) : [];
+      queue.push({ path, rows: [newRow] });
+      await AsyncStorage.setItem(CACHE_KEY_QUEUE, JSON.stringify(queue));
+      return;
+    }
 
     // Always read from local cache first — never re-download mid-session
     // This prevents race conditions where a fresh download overwrites in-progress data
@@ -499,7 +817,6 @@ export default function TimeTracker() {
 
     // Then sync to Dropbox in background
     syncRows(rows, path);
-    showStatus(type === 'START' ? 'Session started!' : 'Session saved!', true);
   };
 
   const handleStart = async () => {
@@ -517,6 +834,7 @@ export default function TimeTracker() {
     const now = new Date();
     const tasksArray = Array.from(currentSessionTasks);
     const sessionDur = currentStartTime ? now.getTime() - currentStartTime.getTime() : 0;
+    const todayTotalBeforeThisSession = totalTodayMs; // capture before any state updates below
     const isDuplicate = noteText.trim().length > 0 && entries.some(e => e.note === noteText.trim());
     const finalNote = noteText.trim().length > 0 && !isDuplicate ? noteText.trim() : '';
     const newEntry: Entry = { type: 'END', timestamp: now, tasks: tasksArray, note: finalNote || undefined };
@@ -530,16 +848,70 @@ export default function TimeTracker() {
     setNoteText('');
     await saveEntry('END', now, tasksArray, finalNote);
     const token = await getAccessToken();
-    if (token) loadAlltimeData(token);
+    const todayTotalAfterThisSession = todayTotalBeforeThisSession + sessionDur;
+    if (token) await updateLifetimeStatsForSession(token, now, sessionDur, tasksArray, todayTotalAfterThisSession);
+  };
+
+  // Incrementally folds one just-completed session into the lifetime stats file,
+  // instead of re-scanning every CSV. Falls back to a full reload if the file
+  // doesn't exist yet (first run before migration has happened).
+  const updateLifetimeStatsForSession = async (
+    token: string, endTime: Date, sessionDur: number, tasks: string[], todayTotalMs: number
+  ) => {
+    try {
+      const existing = await readLifetimeStats(token);
+      if (!existing) { await loadAlltimeData(token); return; }
+
+      const dateStr = formatDate(endTime);
+      const sessionHours = Math.round((sessionDur / 3600000) * 10) / 10;
+
+      // If this session's date is different from the last one we recorded, it's a new day accessed.
+      const isNewDay = existing.lastSeenDate !== dateStr;
+      const updatedDays = isNewDay ? existing.days + 1 : existing.days;
+
+      const taskCounts = { ...(existing.taskCounts || {}) };
+      tasks.forEach(t => { taskCounts[t] = (taskCounts[t] || 0) + 1; });
+      let topTask = existing.topTask || '', topTaskCount = existing.topTaskCount || 0;
+      for (const [task, count] of Object.entries(taskCounts)) {
+        if (count > topTaskCount) { topTask = task; topTaskCount = count; }
+      }
+
+      const totalSessions = (existing.totalSessions || 0) + 1;
+      const totalHours = existing.hours + sessionHours;
+
+      const updated: AlltimeStats = {
+        ...existing,
+        days: updatedDays,
+        lastSeenDate: dateStr,
+        hours: Math.round(totalHours * 10) / 10,
+        totalSessions,
+        avgSessionHours: Math.round((totalHours / totalSessions) * 10) / 10,
+        longestSessionHours: sessionHours > (existing.longestSessionHours || 0) ? sessionHours : existing.longestSessionHours,
+        longestSessionDate: sessionHours > (existing.longestSessionHours || 0) ? dateStr : existing.longestSessionDate,
+        topTask,
+        topTaskCount,
+        taskCounts,
+      };
+
+      // todayTotalMs is passed in explicitly (computed before any async state
+      // updates) so this can't double-count or miss the session that just ended.
+      const todayTotalHours = Math.round((todayTotalMs / 3600000) * 10) / 10;
+      if (todayTotalHours > (existing.bestDayHours || 0)) {
+        updated.bestDayHours = todayTotalHours;
+        updated.bestDayDate = dateStr;
+      }
+
+      setAlltime(updated);
+      await AsyncStorage.setItem(CACHE_KEY_ALLTIME, JSON.stringify(updated));
+      await writeLifetimeStats(token, updated);
+    } catch (e) {
+      console.error('updateLifetimeStatsForSession failed, falling back to full reload:', e);
+      await loadAlltimeData(token);
+    }
   };
 
   const handleTaskPress = (task: string) => {
     setCurrentSessionTasks(prev => { const n = new Set(prev); n.add(task); return n; });
-  };
-
-  const showStatus = (msg: string, ok: boolean) => {
-    setSaveStatus({ msg, ok });
-    setTimeout(() => setSaveStatus(null), 3000);
   };
 
   const onRefresh = useCallback(async () => {
@@ -567,6 +939,85 @@ export default function TimeTracker() {
   }, []);
 
   useEffect(() => { loadToday(); }, [loadToday]);
+
+  const handleShowDebug = async () => {
+    const queue = await AsyncStorage.getItem(CACHE_KEY_QUEUE);
+    const entries_cache = await AsyncStorage.getItem(CACHE_KEY_ENTRIES);
+    const tokenCache = await AsyncStorage.getItem(CACHE_KEY_TOKEN);
+    const parsed_queue = queue ? JSON.parse(queue) : [];
+    const parsed_entries: Record<string, string>[] = entries_cache ? JSON.parse(entries_cache) : [];
+
+    const queueDates = parsed_queue.flatMap((item: { rows: Record<string,string>[] }) =>
+      item.rows.map((r: Record<string,string>) => `${r.Type} ${r.Date} ${r.Time}`)
+    );
+
+    let tokenInfo = 'No cached token';
+    if (tokenCache) {
+      const { expires } = JSON.parse(tokenCache);
+      const mins = Math.round((expires - Date.now()) / 60000);
+      tokenInfo = mins > 0 ? `Token valid ~${mins} min` : `Token EXPIRED ${-mins} min ago`;
+    }
+
+    const info = [
+      `Data confirmed safe to write: ${dataIsAuthoritative.current ? '✅ YES' : '⚠️ NO (writes are queued, not uploaded)'}`,
+      `${tokenInfo}`,
+      lastTokenError ? `Token error: ${lastTokenError}` : '',
+      lastDropboxError ? `Dropbox error: ${lastDropboxError}` : '',
+      `Queue items: ${parsed_queue.length}`,
+      `Cache rows: ${parsed_entries.length}`,
+      `Today's date filter: ${formatDate(new Date())}`,
+      `CSV delimiter: "${detectedDelimiter}"`,
+      `Lifetime stats file: ${LIFETIME_STATS_PATH}`,
+      alltime ? `Sessions: ${alltime.totalSessions ?? '?'} | Longest: ${alltime.longestSessionHours ?? '?'}Hr | Avg: ${alltime.avgSessionHours ?? '?'}Hr | Top goal: ${alltime.topTask ?? '?'}` : '',
+      queueDates.length ? `Queue entries:` : '',
+      ...queueDates,
+    ].filter(Boolean).join('\n');
+
+    setDebugInfo(info);
+    setShowDebug(true);
+  };
+
+  const handleForceFlush = async () => {
+    setFlushStatus('Flushing...');
+    try {
+      const token = await getAccessToken();
+      if (!token) { setFlushStatus(`❌ Could not get Dropbox token: ${lastTokenError}`); return; }
+      await flushQueue(token);
+      const remaining = await AsyncStorage.getItem(CACHE_KEY_QUEUE);
+      const count = remaining ? JSON.parse(remaining).length : 0;
+      setFlushStatus(count === 0 ? '✅ All data synced to Dropbox!' : `⚠️ ${count} items still queued`);
+      await loadToday();
+    } catch (e) {
+      setFlushStatus(`❌ Error: ${e}`);
+    }
+  };
+
+  const handleForceRedownload = async () => {
+    setFlushStatus('Re-downloading from Dropbox...');
+    try {
+      // Clear the cached token to force a guaranteed-fresh refresh
+      await AsyncStorage.removeItem(CACHE_KEY_TOKEN);
+      const token = await getAccessToken();
+      if (!token) { setFlushStatus(`❌ Could not get fresh token: ${lastTokenError}`); return; }
+
+      const filename = getMonthFilename();
+      const result = await downloadCSVSafe(token, `/${filename}`);
+
+      if (result.status === 'ok') {
+        const rows = parseCSV(result.content);
+        await AsyncStorage.setItem(CACHE_KEY_ENTRIES, JSON.stringify(rows));
+        dataIsAuthoritative.current = true;
+        setFlushStatus(`✅ Downloaded ${rows.length} rows from ${filename}`);
+        await loadToday();
+      } else if (result.status === 'not_found') {
+        setFlushStatus(`⚠️ Dropbox says ${filename} does not exist at all`);
+      } else {
+        setFlushStatus(`❌ Download failed: ${lastDropboxError}`);
+      }
+    } catch (e) {
+      setFlushStatus(`❌ Error: ${e}`);
+    }
+  };
 
   // Derived
   const thermoPct   = Math.min(totalTodayMs / (GOAL_HOURS * 3600000), 1);
@@ -650,12 +1101,6 @@ export default function TimeTracker() {
             </TouchableOpacity>
           </View>
 
-          {saveStatus && (
-            <View style={[s.statusBar, saveStatus.ok ? s.statusOk : s.statusErr]}>
-              <Text style={s.statusTxt}>{saveStatus.msg}</Text>
-            </View>
-          )}
-
           {/* Today's Total */}
           <View style={s.statsBox}>
             <Text style={s.sectionTitle}>Today's Total</Text>
@@ -735,7 +1180,7 @@ export default function TimeTracker() {
 
           {/* Timeline */}
           <View style={s.statsBox}>
-            <Text style={s.sectionTitle}>Complete Timeline</Text>
+            <Text style={s.sectionTitle}>Today's Timeline</Text>
             {sessions.length === 0
               ? <Text style={s.noSessions}>No sessions yet</Text>
               : sessions.slice().reverse().map(session => (
@@ -773,8 +1218,61 @@ export default function TimeTracker() {
             </View>
           </View>
 
-          {/* Version */}
-          <Text style={s.version}>{APP_VERSION}</Text>
+          {alltime && (alltime.longestSessionHours || alltime.avgSessionHours || alltime.bestDayHours || alltime.topTask) && (
+            <View style={s.recordsBox}>
+              {alltime.longestSessionHours ? (
+                <View style={s.recordRow}>
+                  <Text style={s.recordLabel}>Longest session</Text>
+                  <Text style={s.recordValue}>
+                    {alltime.longestSessionHours} Hr{alltime.longestSessionDate ? ` · ${alltime.longestSessionDate}` : ''}
+                  </Text>
+                </View>
+              ) : null}
+              {alltime.avgSessionHours ? (
+                <View style={s.recordRow}>
+                  <Text style={s.recordLabel}>Avg session</Text>
+                  <Text style={s.recordValue}>{alltime.avgSessionHours} Hr</Text>
+                </View>
+              ) : null}
+              {alltime.bestDayHours ? (
+                <View style={s.recordRow}>
+                  <Text style={s.recordLabel}>Best day</Text>
+                  <Text style={s.recordValue}>
+                    {alltime.bestDayHours} Hr{alltime.bestDayDate ? ` · ${alltime.bestDayDate}` : ''}
+                  </Text>
+                </View>
+              ) : null}
+              {alltime.topTask ? (
+                <View style={s.recordRow}>
+                  <Text style={s.recordLabel}>Most-used goal</Text>
+                  <Text style={s.recordValue}>{alltime.topTask} ({alltime.topTaskCount})</Text>
+                </View>
+              ) : null}
+            </View>
+          )}
+
+          {/* Version — tap to open debug panel */}
+          <TouchableOpacity onPress={handleShowDebug}>
+            <Text style={s.version}>{APP_VERSION}</Text>
+          </TouchableOpacity>
+
+          {/* Debug Panel */}
+          {showDebug && (
+            <View style={s.debugPanel}>
+              <Text style={s.debugTitle}>Debug / Sync Panel</Text>
+              <Text style={s.debugInfo}>{debugInfo}</Text>
+              {flushStatus ? <Text style={s.flushStatus}>{flushStatus}</Text> : null}
+              <TouchableOpacity style={s.debugBtn} onPress={handleForceFlush}>
+                <Text style={s.debugBtnTxt}>Force Flush to Dropbox</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={s.debugBtn} onPress={handleForceRedownload}>
+                <Text style={s.debugBtnTxt}>Force Re-download from Dropbox</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={s.debugCloseBtn} onPress={() => { setShowDebug(false); setFlushStatus(''); }}>
+                <Text style={s.debugCloseTxt}>Close</Text>
+              </TouchableOpacity>
+            </View>
+          )}
 
         </View>
       </ScrollView>
@@ -832,12 +1330,6 @@ const s = StyleSheet.create({
   btnEnd: { backgroundColor: '#ef4444' },
   btnDim: { opacity: 0.45 },
   btnTxt: { color: 'white', fontSize: 16, fontWeight: '700', letterSpacing: 1.5 },
-
-  // Status
-  statusBar: { borderRadius: 8, padding: 10, alignItems: 'center' },
-  statusOk: { backgroundColor: '#d1fae5' },
-  statusErr: { backgroundColor: '#fee2e2' },
-  statusTxt: { fontSize: 13, fontWeight: '600', color: '#065f46' },
 
   // Stats boxes
   statsBox: { backgroundColor: '#f3f4f6', borderRadius: 12, padding: 14, gap: 10 },
@@ -899,6 +1391,22 @@ const s = StyleSheet.create({
   lifetimeLbl: { fontSize: 10, fontWeight: '600', color: 'rgba(255,255,255,0.85)', letterSpacing: 0.5, marginTop: 4 },
   lifetimeDiv: { width: 1, height: 40, backgroundColor: 'rgba(255,255,255,0.3)' },
 
+  // Records (longest session, avg session, best day, top goal)
+  recordsBox: { backgroundColor: '#f3f4f6', borderRadius: 12, padding: 14, gap: 8 },
+  recordRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  recordLabel: { fontSize: 13, color: '#6b7280', fontWeight: '600' },
+  recordValue: { fontSize: 13, color: '#374151', fontWeight: '700' },
+
   // Version
   version: { fontSize: 11, color: '#c4b5fd', textAlign: 'center', marginTop: 4, marginBottom: 2 },
+
+  // Debug panel
+  debugPanel: { backgroundColor: '#1e1b4b', borderRadius: 12, padding: 16, gap: 10 },
+  debugTitle: { fontSize: 15, fontWeight: '700', color: 'white' },
+  debugInfo: { fontSize: 11, color: '#a5b4fc', fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace', lineHeight: 18 },
+  flushStatus: { fontSize: 13, fontWeight: '600', color: '#34d399' },
+  debugBtn: { backgroundColor: '#667eea', borderRadius: 8, padding: 12, alignItems: 'center' },
+  debugBtnTxt: { color: 'white', fontWeight: '700', fontSize: 14 },
+  debugCloseBtn: { alignItems: 'center', padding: 8 },
+  debugCloseTxt: { color: '#a5b4fc', fontSize: 13 },
 });
